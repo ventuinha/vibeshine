@@ -161,6 +161,9 @@ namespace platf::dxgi {
     std::atomic<bool> _initialized {false};  ///< True once the most recent initialization attempt succeeded.
     std::atomic<bool> _should_swap_to_dxgi {false};  ///< True if capture should fallback.
     std::atomic<bool> _force_reinit {false};  ///< True if reinit required due to errors.
+    std::atomic<uint64_t> _frames_acquired {0};  ///< Count of consumed IPC frames for sampled diagnostics.
+    std::atomic<uint64_t> _slow_event_waits {0};  ///< Count of sampled/slow frame-ready waits.
+    std::atomic<uint64_t> _slow_mutex_waits {0};  ///< Count of slow keyed mutex waits.
     UINT _width = 0;  ///< Shared texture width.
     UINT _height = 0;  ///< Shared texture height.
     ::video::config_t _config;  ///< Cached video config.

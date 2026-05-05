@@ -13,6 +13,7 @@
 
 // standard includes
 #include <atomic>
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <deque>
@@ -127,7 +128,7 @@ const int INITIAL_LOG_LEVEL = 2;
 /**
  * @brief Global configuration data received from the main process.
  */
-static platf::dxgi::config_data_t g_config = {0, 0, L"", {0, 0}, 0};
+static platf::dxgi::config_data_t g_config = {0, 0, L"", {0, 0}, 0, 60, 1, 4, platf::dxgi::WGC_IPC_FLAG_DRAIN_TO_LATEST | platf::dxgi::WGC_IPC_FLAG_ALLOW_BUFFER_DECREASE};
 static std::mutex g_config_mutex;
 static std::condition_variable g_config_cv;
 
@@ -1030,14 +1031,23 @@ private:
   winrt::event_token _frame_arrived_token {};  ///< Event token for frame arrival notifications
   std::optional<WgcCaptureDependencies> _deps;  ///< Dependencies for frame processing
 
+  uint32_t _initial_buffer_size = 1;  ///< Minimum steady-state frame buffer size for this stream
   uint32_t _current_buffer_size = 1;  ///< Current frame buffer size for dynamic adjustment
-  static constexpr uint32_t MAX_BUFFER_SIZE = 4;  ///< Maximum allowed buffer size
+  uint32_t _max_buffer_size = 4;  ///< Maximum allowed buffer size for adaptive growth
+  static constexpr uint32_t ABSOLUTE_MAX_BUFFER_SIZE = 4;  ///< Hard cap to bound latency/VRAM
 
   std::deque<std::chrono::steady_clock::time_point> _drop_timestamps;  ///< Timestamps of recent frame drops for analysis
   std::atomic<int> _outstanding_frames {0};  ///< Number of frames currently being processed
   std::atomic<int> _peak_outstanding {0};  ///< Peak number of outstanding frames (for monitoring)
   std::chrono::steady_clock::time_point _last_quiet_start = std::chrono::steady_clock::now();  ///< Last time frame processing became quiet
   std::chrono::steady_clock::time_point _last_buffer_check = std::chrono::steady_clock::now();  ///< Last time buffer size was checked
+  std::mutex _stats_mutex;
+  std::optional<std::chrono::steady_clock::time_point> _last_arrival_time;
+  uint64_t _last_arrival_frame_qpc = 0;
+  std::atomic<uint64_t> _frame_arrival_count {0};
+  std::atomic<uint64_t> _drained_pool_frames {0};
+  std::atomic<uint64_t> _slow_mutex_waits {0};
+  std::atomic<uint64_t> _slow_copy_submissions {0};
   std::mutex _delivery_mutex;
   std::condition_variable _delivery_cv;
   std::jthread _delivery_thread;
@@ -1066,6 +1076,18 @@ public:
       _capture_format(capture_format),
       _height(height),
       _width(width) {
+    _max_buffer_size = std::clamp<uint32_t>(
+      g_config.max_frame_buffer_size ? g_config.max_frame_buffer_size : ABSOLUTE_MAX_BUFFER_SIZE,
+      1,
+      ABSOLUTE_MAX_BUFFER_SIZE
+    );
+    _initial_buffer_size = std::clamp<uint32_t>(
+      g_config.initial_frame_buffer_size ? g_config.initial_frame_buffer_size : 1,
+      1,
+      _max_buffer_size
+    );
+    _current_buffer_size = _initial_buffer_size;
+
     _delivery_thread = std::jthread([this](std::stop_token stop_token) {
       delivery_thread_proc(stop_token);
     });
@@ -1224,24 +1246,45 @@ public:
       BOOST_LOG(info) << "First FrameArrived callback invoked";
     }
 
-    if (auto frame = sender.TryGetNextFrame(); frame) {
-      // Frame successfully retrieved
-      auto surface = frame.Surface();
+    Direct3D11CaptureFrame frame = nullptr;
+    uint32_t drained_frames = 0;
 
-      try {
-        // Get frame timing information from the WGC frame
-        uint64_t frame_qpc = frame.SystemRelativeTime().count();
-        queue_frame_for_delivery(std::move(frame), surface, frame_qpc);
-      } catch (const winrt::hresult_error &ex) {
-        // Log error
-        BOOST_LOG(error) << "WinRT error in frame processing: " << ex.code() << " - " << winrt::to_string(ex.message());
+    try {
+      if (drain_to_latest()) {
+        while (auto next_frame = sender.TryGetNextFrame()) {
+          if (frame) {
+            ++drained_frames;
+          }
+          frame = std::move(next_frame);
+        }
+      } else {
+        frame = sender.TryGetNextFrame();
       }
-    } else {
+    } catch (const winrt::hresult_error &ex) {
+      BOOST_LOG(error) << "WinRT error retrieving WGC frame: " << ex.code() << " - " << winrt::to_string(ex.message());
+      return;
+    }
+
+    if (!frame) {
       // Frame drop detected - record timestamp for sliding window analysis
       auto now = std::chrono::steady_clock::now();
       _drop_timestamps.push_back(now);
 
       BOOST_LOG(info) << "Frame drop detected (total drops in 5s window: " << _drop_timestamps.size() << ")";
+    } else {
+      // Frame successfully retrieved
+      try {
+        const auto arrival_time = std::chrono::steady_clock::now();
+        auto surface = frame.Surface();
+
+        // Get frame timing information from the WGC frame
+        uint64_t frame_qpc = frame.SystemRelativeTime().count();
+        record_frame_arrival(frame_qpc, arrival_time, drained_frames);
+        queue_frame_for_delivery(std::move(frame), surface, frame_qpc);
+      } catch (const winrt::hresult_error &ex) {
+        // Log error
+        BOOST_LOG(error) << "WinRT error in frame processing: " << ex.code() << " - " << winrt::to_string(ex.message());
+      }
     }
 
     // Check if we need to adjust frame buffer size
@@ -1249,6 +1292,51 @@ public:
   }
 
 private:
+  bool drain_to_latest() const {
+    return (g_config.flags & platf::dxgi::WGC_IPC_FLAG_DRAIN_TO_LATEST) != 0;
+  }
+
+  bool allow_buffer_decrease() const {
+    return (g_config.flags & platf::dxgi::WGC_IPC_FLAG_ALLOW_BUFFER_DECREASE) != 0;
+  }
+
+  void record_frame_arrival(uint64_t frame_qpc, const std::chrono::steady_clock::time_point &arrival_time, uint32_t drained_frames) {
+    const auto count = _frame_arrival_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (drained_frames > 0) {
+      const auto total_drained = _drained_pool_frames.fetch_add(drained_frames, std::memory_order_relaxed) + drained_frames;
+      if (total_drained == drained_frames || total_drained % 300 == 0) {
+        BOOST_LOG(debug) << "WGC drained " << drained_frames << " queued frame(s) from frame pool"
+                         << " (total drained=" << total_drained << ")";
+      }
+    }
+
+    std::optional<double> arrival_delta_ms;
+    std::optional<int64_t> frame_qpc_delta;
+    {
+      std::lock_guard lock(_stats_mutex);
+      if (_last_arrival_time) {
+        arrival_delta_ms = std::chrono::duration<double, std::milli>(arrival_time - *_last_arrival_time).count();
+      }
+      if (_last_arrival_frame_qpc != 0 && frame_qpc >= _last_arrival_frame_qpc) {
+        frame_qpc_delta = static_cast<int64_t>(frame_qpc - _last_arrival_frame_qpc);
+      }
+      _last_arrival_time = arrival_time;
+      _last_arrival_frame_qpc = frame_qpc;
+    }
+
+    const double expected_frame_ms = 1000.0 / static_cast<double>(std::max(1, g_config.target_fps));
+    const double cadence_warning_ms = std::max(25.0, expected_frame_ms * 1.5);
+    if (count == 1 || count % 600 == 0 || drained_frames > 0 ||
+        (arrival_delta_ms && *arrival_delta_ms > cadence_warning_ms)) {
+      BOOST_LOG(debug) << "WGC frame cadence: count=" << count
+                       << " arrival_delta_ms=" << (arrival_delta_ms ? *arrival_delta_ms : 0.0)
+                       << " frame_qpc_delta=" << (frame_qpc_delta ? *frame_qpc_delta : 0)
+                       << " buffer=" << _current_buffer_size
+                       << " pending_replaced=" << _replaced_pending_frames.load(std::memory_order_relaxed)
+                       << " drained_pool=" << _drained_pool_frames.load(std::memory_order_relaxed);
+    }
+  }
+
   /**
    * @brief Prunes old frame drop timestamps from the sliding window.
    * @param now Current timestamp for comparison.
@@ -1265,7 +1353,7 @@ private:
    * @return true if buffer was increased, false otherwise.
    */
   bool try_increase_buffer_size(const std::chrono::steady_clock::time_point &now) {
-    if (_drop_timestamps.size() >= 2 && _current_buffer_size < MAX_BUFFER_SIZE) {
+    if (_drop_timestamps.size() >= 2 && _current_buffer_size < _max_buffer_size) {
       uint32_t new_buffer_size = _current_buffer_size + 1;
       BOOST_LOG(info) << "Detected " << _drop_timestamps.size() << " frame drops in 5s window, increasing buffer from "
                       << _current_buffer_size << " to " << new_buffer_size;
@@ -1284,6 +1372,10 @@ private:
    * @return true if buffer was decreased, false otherwise.
    */
   bool try_decrease_buffer_size(const std::chrono::steady_clock::time_point &now) {
+    if (!allow_buffer_decrease()) {
+      return false;
+    }
+
     bool is_quiet = _drop_timestamps.empty() &&
                     _peak_outstanding.load() <= static_cast<int>(_current_buffer_size) - 1;
 
@@ -1293,7 +1385,7 @@ private:
     }
 
     // Check if we've been quiet for 30 seconds
-    if (now - _last_quiet_start >= std::chrono::seconds(30) && _current_buffer_size > 1) {
+    if (now - _last_quiet_start >= std::chrono::seconds(30) && _current_buffer_size > _initial_buffer_size) {
       uint32_t new_buffer_size = _current_buffer_size - 1;
       BOOST_LOG(info) << "Sustained quiet period (30s) with peak occupancy " << _peak_outstanding.load()
                       << " ≤ " << (_current_buffer_size - 1) << ", decreasing buffer from "
@@ -1413,7 +1505,9 @@ private:
       return;
     }
 
+    const auto mutex_wait_start = std::chrono::steady_clock::now();
     HRESULT hr = _deps->resource_manager.get_keyed_mutex()->AcquireSync(0, 200);
+    const auto mutex_wait = std::chrono::steady_clock::now() - mutex_wait_start;
     if (hr == WAIT_TIMEOUT) {
       BOOST_LOG(error) << "Timed out acquiring keyed mutex; dropping frame";
       return;
@@ -1428,7 +1522,9 @@ private:
 
     // Copy frame data while holding the keyed mutex. The main process acquires
     // the same mutex before snapshotting this shared texture into a pool-owned frame.
+    const auto copy_start = std::chrono::steady_clock::now();
     _deps->d3d_context->CopyResource(_deps->resource_manager.get_shared_texture().get(), frame_tex.get());
+    const auto copy_submit = std::chrono::steady_clock::now() - copy_start;
 
     // Publish before releasing the keyed mutex so the consumer snapshots metadata
     // while holding the same mutex that protects the shared texture contents.
@@ -1436,6 +1532,23 @@ private:
     const HRESULT rel_hr = _deps->resource_manager.get_keyed_mutex()->ReleaseSync(0);
     if (FAILED(rel_hr)) {
       BOOST_LOG(warning) << "Failed to release mutex key 0: " << std::format(": 0x{:08X}", rel_hr);
+    }
+
+    const auto mutex_wait_ms = std::chrono::duration<double, std::milli>(mutex_wait).count();
+    const auto copy_submit_ms = std::chrono::duration<double, std::milli>(copy_submit).count();
+    const bool slow_mutex = mutex_wait_ms > 1.0;
+    const bool slow_copy = copy_submit_ms > 1.0;
+    if (slow_mutex || slow_copy) {
+      const auto slow_mutex_count = slow_mutex ? (_slow_mutex_waits.fetch_add(1, std::memory_order_relaxed) + 1) : _slow_mutex_waits.load(std::memory_order_relaxed);
+      const auto slow_copy_count = slow_copy ? (_slow_copy_submissions.fetch_add(1, std::memory_order_relaxed) + 1) : _slow_copy_submissions.load(std::memory_order_relaxed);
+      const bool should_log_slow_mutex = slow_mutex && (slow_mutex_count <= 5 || slow_mutex_count % 120 == 0);
+      const bool should_log_slow_copy = slow_copy && (slow_copy_count <= 5 || slow_copy_count % 120 == 0);
+      if (should_log_slow_mutex || should_log_slow_copy) {
+        BOOST_LOG(debug) << "WGC helper copy timing: mutex_wait_ms=" << mutex_wait_ms
+                         << " copy_submit_ms=" << copy_submit_ms
+                         << " slow_mutex_count=" << slow_mutex_count
+                         << " slow_copy_count=" << slow_copy_count;
+      }
     }
 
     // Log first frame and frame 100 for quick sanity checks, but avoid long-running spam.
@@ -1678,7 +1791,12 @@ void handle_ipc_message(std::span<const uint8_t> message) {
     BOOST_LOG(info) << "Received config data: hdr: " << g_config.dynamic_range
                     << ", display: '" << winrt::to_string(g_config.display_name) << "'"
                     << ", adapter LUID: " << std::hex << g_config.adapter_luid.HighPart
-                    << ":" << g_config.adapter_luid.LowPart << std::dec;
+                    << ":" << g_config.adapter_luid.LowPart << std::dec
+                    << ", target_fps: " << g_config.target_fps
+                    << ", min_update_interval_100ns: " << g_config.min_update_interval_100ns
+                    << ", initial_buffers: " << g_config.initial_frame_buffer_size
+                    << ", max_buffers: " << g_config.max_frame_buffer_size
+                    << ", drain_to_latest: " << ((g_config.flags & platf::dxgi::WGC_IPC_FLAG_DRAIN_TO_LATEST) ? "yes" : "no");
     g_config_cv.notify_all();
   }
 }
@@ -1926,7 +2044,12 @@ int main(int argc, char *argv[]) {
 
   // Create WGC capture manager
   WgcCaptureManager wgc_capture_manager {capture_format, display_manager.get_width(), display_manager.get_height(), std::move(deps)};
-  if (!wgc_capture_manager.create_or_adjust_frame_pool(1)) {
+  const auto initial_frame_buffer_size = std::clamp<uint32_t>(
+    g_config.initial_frame_buffer_size ? g_config.initial_frame_buffer_size : 1,
+    1,
+    std::max<uint32_t>(1, g_config.max_frame_buffer_size ? g_config.max_frame_buffer_size : 1)
+  );
+  if (!wgc_capture_manager.create_or_adjust_frame_pool(initial_frame_buffer_size)) {
     BOOST_LOG(error) << "Failed to create frame pool";
     return 1;
   }

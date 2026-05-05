@@ -34,7 +34,11 @@
 namespace platf::dxgi {
   namespace {
     constexpr auto kRecentDesktopSwitchGrace = std::chrono::seconds(3);
-    constexpr std::int64_t kWgcMinUpdateInterval100ns = 10000;  // 1 ms
+    constexpr std::int64_t kWgcMinUpdateIntervalMin100ns = 10000;  // 1 ms
+    constexpr std::int64_t kWgcMinUpdateIntervalMax100ns = 83333;  // ~8.33 ms, still allows 120 Hz capture
+    constexpr uint32_t kWgcLatencyInitialBufferSize = 1;
+    constexpr uint32_t kWgcDrainingInitialBufferSize = 2;
+    constexpr uint32_t kWgcMaxBufferSize = 4;
     std::atomic<std::int64_t> g_last_wgc_desktop_switch_us {0};
 
     std::int64_t now_steady_us() {
@@ -46,8 +50,59 @@ namespace platf::dxgi {
       g_last_wgc_desktop_switch_us.store(now_steady_us(), std::memory_order_relaxed);
     }
 
-    std::int64_t wgc_min_update_interval_100ns() {
-      return kWgcMinUpdateInterval100ns;
+    int wgc_target_fps(const ::video::config_t &config) {
+      if (config.framerate > 0) {
+        return config.framerate;
+      }
+
+      if (config.framerateX100 > 0) {
+        return std::max(1, (config.framerateX100 + 50) / 100);
+      }
+
+      return 60;
+    }
+
+    std::int64_t wgc_min_update_interval_100ns(const ::video::config_t &config) {
+      const auto target_fps = std::max(1, wgc_target_fps(config));
+      // Request updates at up to 2x the stream rate. This keeps WGC responsive while reducing
+      // unnecessary burst pressure compared to an unconditional 1ms interval.
+      const auto half_frame_interval_100ns = 5000000LL / target_fps;
+      return std::clamp(
+        half_frame_interval_100ns,
+        kWgcMinUpdateIntervalMin100ns,
+        kWgcMinUpdateIntervalMax100ns
+      );
+    }
+
+    uint32_t wgc_ipc_flags() {
+      uint32_t flags = WGC_IPC_FLAG_ALLOW_BUFFER_DECREASE;
+
+      // Variable/default WGC benefits from draining queued WGC frames to the newest image
+      // when the helper falls behind. Constant-FPS WGC preserves queue order and lets
+      // downstream pacing decide whether to repeat/drop.
+      if (config::video.capture != "wgcc") {
+        flags |= WGC_IPC_FLAG_DRAIN_TO_LATEST;
+      }
+
+      return flags;
+    }
+
+    uint32_t wgc_initial_frame_buffer_size() {
+      // A two-buffer WGC pool is only latency-neutral when we also drain queued
+      // pool frames to the latest frame before delivery. Constant-FPS WGC keeps
+      // ordered delivery, so leave it at one buffer to avoid adding capture latency.
+      return (wgc_ipc_flags() & WGC_IPC_FLAG_DRAIN_TO_LATEST) ?
+               kWgcDrainingInitialBufferSize :
+               kWgcLatencyInitialBufferSize;
+    }
+
+    uint32_t wgc_max_frame_buffer_size() {
+      // Do not grow ordered-delivery captures beyond one queued frame. For
+      // drain-to-latest captures, extra WGC pool capacity is used only as a
+      // short stall absorber and stale frames are discarded before delivery.
+      return (wgc_ipc_flags() & WGC_IPC_FLAG_DRAIN_TO_LATEST) ?
+               kWgcMaxBufferSize :
+               kWgcLatencyInitialBufferSize;
     }
 
     struct frame_metadata_snapshot_t {
@@ -270,7 +325,11 @@ namespace platf::dxgi {
     config_data_t config_data = {};
     config_data.dynamic_range = _config.dynamicRange;
     config_data.log_level = config::sunshine.min_log_level;
-    config_data.min_update_interval_100ns = wgc_min_update_interval_100ns();
+    config_data.min_update_interval_100ns = wgc_min_update_interval_100ns(_config);
+    config_data.target_fps = wgc_target_fps(_config);
+    config_data.flags = wgc_ipc_flags();
+    config_data.initial_frame_buffer_size = wgc_initial_frame_buffer_size();
+    config_data.max_frame_buffer_size = wgc_max_frame_buffer_size();
 
     // Convert display_name (std::string) to wchar_t[32]
     if (!_display_name.empty()) {
@@ -438,7 +497,9 @@ namespace platf::dxgi {
   }
 
   capture_e ipc_session_t::acquire(std::chrono::milliseconds timeout, winrt::com_ptr<ID3D11Texture2D> &gpu_tex_out, uint64_t &frame_qpc_out) {
+    const auto wait_start = std::chrono::steady_clock::now();
     auto wait_status = wait_for_frame(timeout);
+    const auto event_wait = std::chrono::steady_clock::now() - wait_start;
     if (wait_status != capture_e::ok) {
       return wait_status;
     }
@@ -450,7 +511,9 @@ namespace platf::dxgi {
       return capture_e::reinit;
     }
 
+    const auto mutex_wait_start = std::chrono::steady_clock::now();
     HRESULT hr = _keyed_mutex->AcquireSync(0, 3000);
+    const auto mutex_wait = std::chrono::steady_clock::now() - mutex_wait_start;
 
     if (hr == WAIT_ABANDONED) {
       BOOST_LOG(error) << "Helper process abandoned the keyed mutex, implying it may have crashed or was forcefully terminated.";
@@ -492,6 +555,27 @@ namespace platf::dxgi {
 
     _last_frame_id = snapshot.frame_id;
     _frame_qpc = static_cast<uint64_t>(snapshot.frame_qpc);
+
+    const auto frame_count = _frames_acquired.fetch_add(1, std::memory_order_relaxed) + 1;
+    const auto event_wait_ms = std::chrono::duration<double, std::milli>(event_wait).count();
+    const auto mutex_wait_ms = std::chrono::duration<double, std::milli>(mutex_wait).count();
+    const bool sampled_frame = frame_count == 1 || frame_count % 600 == 0;
+    const bool slow_event_wait = event_wait_ms > 5.0 && timeout.count() == 0;
+    const bool slow_mutex_wait = mutex_wait_ms > 1.0;
+    if (slow_event_wait) {
+      _slow_event_waits.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (slow_mutex_wait) {
+      _slow_mutex_waits.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (sampled_frame || slow_event_wait || slow_mutex_wait) {
+      BOOST_LOG(debug) << "WGC IPC acquire timing: frame=" << frame_count
+                       << " event_wait_ms=" << event_wait_ms
+                       << " mutex_wait_ms=" << mutex_wait_ms
+                       << " frame_id=" << _last_frame_id
+                       << " slow_event_waits=" << _slow_event_waits.load(std::memory_order_relaxed)
+                       << " slow_mutex_waits=" << _slow_mutex_waits.load(std::memory_order_relaxed);
+    }
 
     // Set output parameters
     gpu_tex_out = _shared_texture;

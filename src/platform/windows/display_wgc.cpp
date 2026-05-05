@@ -5,6 +5,7 @@
 
 // standard includes
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <winsock2.h>
 #include <dxgi1_2.h>
@@ -29,6 +30,10 @@ namespace platf::dxgi {
       bool secure_desktop_active;
       bool recent_desktop_switch;
     };
+
+    std::atomic<uint64_t> g_wgc_snapshot_copies {0};
+    std::atomic<uint64_t> g_wgc_slow_snapshot_locks {0};
+    std::atomic<uint64_t> g_wgc_slow_snapshot_copies {0};
 
     class adapter_luid_override_guard {
     public:
@@ -174,7 +179,9 @@ namespace platf::dxgi {
         return capture_e::error;
       }
 
+      const auto capture_mutex_wait_start = std::chrono::steady_clock::now();
       HRESULT status = d3d_img->capture_mutex->AcquireSync(0, 3000);
+      const auto capture_mutex_wait = std::chrono::steady_clock::now() - capture_mutex_wait_start;
       if (status == WAIT_ABANDONED) {
         BOOST_LOG(error) << "Capture texture keyed mutex was abandoned; continuing with lock held";
       } else if (status != S_OK) {
@@ -191,8 +198,29 @@ namespace platf::dxgi {
 
       // The IPC texture is a single mutable helper-owned surface. Snapshot it into
       // this pool-owned texture so queued encoder frames remain stable.
+      const auto copy_start = std::chrono::steady_clock::now();
       device_ctx->CopyResource(d3d_img->capture_texture.get(), src.get());
+      const auto copy_submit = std::chrono::steady_clock::now() - copy_start;
       d3d_img->blank = false;
+
+      const auto copy_count = g_wgc_snapshot_copies.fetch_add(1, std::memory_order_relaxed) + 1;
+      const auto capture_mutex_wait_ms = std::chrono::duration<double, std::milli>(capture_mutex_wait).count();
+      const auto copy_submit_ms = std::chrono::duration<double, std::milli>(copy_submit).count();
+      const bool slow_lock = capture_mutex_wait_ms > 1.0;
+      const bool slow_copy = copy_submit_ms > 1.0;
+      if (slow_lock) {
+        g_wgc_slow_snapshot_locks.fetch_add(1, std::memory_order_relaxed);
+      }
+      if (slow_copy) {
+        g_wgc_slow_snapshot_copies.fetch_add(1, std::memory_order_relaxed);
+      }
+      if (copy_count == 1 || copy_count % 600 == 0 || slow_lock || slow_copy) {
+        BOOST_LOG(debug) << "WGC snapshot copy timing: frame=" << copy_count
+                         << " capture_mutex_wait_ms=" << capture_mutex_wait_ms
+                         << " copy_submit_ms=" << copy_submit_ms
+                         << " slow_locks=" << g_wgc_slow_snapshot_locks.load(std::memory_order_relaxed)
+                         << " slow_copies=" << g_wgc_slow_snapshot_copies.load(std::memory_order_relaxed);
+      }
 
       img->frame_timestamp = frame_timestamp;
       img->host_processing_timestamp = host_processing_timestamp;
