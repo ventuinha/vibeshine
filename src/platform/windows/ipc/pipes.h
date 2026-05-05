@@ -65,12 +65,15 @@ namespace platf::dxgi {
    * @param log_level Logging level.
    * @param display_name Display name (wide string, max 32 chars).
    * @param adapter_luid LUID of the DXGI adapter to use for D3D11 device creation.
+   * @param min_update_interval_100ns Requested WGC minimum update interval in 100ns ticks.
+   *   Sunshine uses a fast interval because the system default can clamp WGC near 60 Hz.
    */
   struct config_data_t {
     int dynamic_range;
     int log_level;
     wchar_t display_name[32];
     LUID adapter_luid;
+    int64_t min_update_interval_100ns;
   };
 
   /**

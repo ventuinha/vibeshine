@@ -127,7 +127,7 @@ const int INITIAL_LOG_LEVEL = 2;
 /**
  * @brief Global configuration data received from the main process.
  */
-static platf::dxgi::config_data_t g_config = {0, 0, L"", {0, 0}};
+static platf::dxgi::config_data_t g_config = {0, 0, L"", {0, 0}, 0};
 static std::mutex g_config_mutex;
 static std::condition_variable g_config_cv;
 
@@ -1038,7 +1038,6 @@ private:
   std::atomic<int> _peak_outstanding {0};  ///< Peak number of outstanding frames (for monitoring)
   std::chrono::steady_clock::time_point _last_quiet_start = std::chrono::steady_clock::now();  ///< Last time frame processing became quiet
   std::chrono::steady_clock::time_point _last_buffer_check = std::chrono::steady_clock::now();  ///< Last time buffer size was checked
-  winrt::com_ptr<ID3D11Query> _copy_complete_query;  ///< GPU completion query for shared texture copies
   std::mutex _delivery_mutex;
   std::condition_variable _delivery_cv;
   std::jthread _delivery_thread;
@@ -1308,62 +1307,6 @@ private:
     return false;
   }
 
-  bool ensure_copy_complete_query() {
-    if (_copy_complete_query) {
-      return true;
-    }
-
-    if (!_deps || !_deps->d3d_context) {
-      return false;
-    }
-
-    winrt::com_ptr<ID3D11Device> device;
-    _deps->d3d_context->GetDevice(device.put());
-    if (!device) {
-      BOOST_LOG(error) << "Failed to get D3D11 device for WGC copy completion query";
-      return false;
-    }
-
-    D3D11_QUERY_DESC query_desc {};
-    query_desc.Query = D3D11_QUERY_EVENT;
-    const HRESULT hr = device->CreateQuery(&query_desc, _copy_complete_query.put());
-    if (FAILED(hr)) {
-      BOOST_LOG(error) << "Failed to create WGC copy completion query: " << std::format(": 0x{:08X}", hr);
-      return false;
-    }
-
-    return true;
-  }
-
-  bool wait_for_copy_completion() {
-    if (!_deps || !_deps->d3d_context || !ensure_copy_complete_query()) {
-      return false;
-    }
-
-    _deps->d3d_context->End(_copy_complete_query.get());
-    _deps->d3d_context->Flush();
-
-    constexpr auto max_wait = std::chrono::milliseconds(20);
-    const auto deadline = std::chrono::steady_clock::now() + max_wait;
-    for (;;) {
-      const HRESULT hr = _deps->d3d_context->GetData(_copy_complete_query.get(), nullptr, 0, D3D11_ASYNC_GETDATA_DONOTFLUSH);
-      if (hr == S_OK) {
-        return true;
-      }
-      if (hr != S_FALSE) {
-        BOOST_LOG(error) << "WGC copy completion query failed: " << std::format(": 0x{:08X}", hr);
-        _copy_complete_query = nullptr;
-        return false;
-      }
-      if (std::chrono::steady_clock::now() >= deadline) {
-        BOOST_LOG(warning) << "Timed out waiting for WGC shared texture copy to complete; dropping frame";
-        _copy_complete_query = nullptr;
-        return false;
-      }
-      SwitchToThread();
-    }
-  }
-
   /**
    * @brief Queues the newest WGC frame for the delivery thread.
    * @param frame The WGC frame object, kept alive until the GPU copy finishes.
@@ -1483,15 +1426,9 @@ private:
       BOOST_LOG(error) << "Keyed mutex was abandoned; continuing with lock held";
     }
 
-    // Copy frame data and wait until the shared texture is actually populated before signaling.
+    // Copy frame data while holding the keyed mutex. The main process acquires
+    // the same mutex before snapshotting this shared texture into a pool-owned frame.
     _deps->d3d_context->CopyResource(_deps->resource_manager.get_shared_texture().get(), frame_tex.get());
-    if (!wait_for_copy_completion()) {
-      const HRESULT rel_hr = _deps->resource_manager.get_keyed_mutex()->ReleaseSync(0);
-      if (FAILED(rel_hr)) {
-        BOOST_LOG(warning) << "Failed to release mutex key 0 after dropped frame: " << std::format(": 0x{:08X}", rel_hr);
-      }
-      return;
-    }
 
     // Publish before releasing the keyed mutex so the consumer snapshots metadata
     // while holding the same mutex that protects the shared texture contents.
@@ -1578,10 +1515,13 @@ public:
       }
     }
 
-    // Technically this is not required for users that have 24H2, but there's really no functional difference.
-    // So instead of coding out a version check, we'll just set it for everyone.
     if (winrt::Windows::Foundation::Metadata::ApiInformation::IsPropertyPresent(L"Windows.Graphics.Capture.GraphicsCaptureSession", L"MinUpdateInterval")) {
-      _capture_session.MinUpdateInterval(winrt::Windows::Foundation::TimeSpan {10000});
+      if (g_config.min_update_interval_100ns > 0) {
+        _capture_session.MinUpdateInterval(winrt::Windows::Foundation::TimeSpan {g_config.min_update_interval_100ns});
+        BOOST_LOG(info) << "WGC MinUpdateInterval set to " << g_config.min_update_interval_100ns << " ticks";
+      } else {
+        BOOST_LOG(info) << "WGC MinUpdateInterval left at system default";
+      }
     }
 
     return true;

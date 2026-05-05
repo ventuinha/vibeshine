@@ -392,9 +392,6 @@ namespace platf::dxgi {
    * allowing screen capture even when running as a SYSTEM service.
    */
   class display_wgc_ipc_vram_t: public display_vram_t {
-    // Cache for frame forwarding when no new frame is available
-    std::shared_ptr<platf::img_t> last_cached_frame;
-
   public:
     /**
      * @brief Constructs a new display_wgc_ipc_vram_t object.
@@ -552,10 +549,6 @@ namespace platf::dxgi {
      */
     DXGI_FORMAT _last_format = DXGI_FORMAT_UNKNOWN;
 
-    /**
-     * @brief Cache for frame forwarding when no new frame is available, only used in constant capture mode.
-     */
-    std::shared_ptr<platf::img_t> last_cached_frame;
   };
 
   /**

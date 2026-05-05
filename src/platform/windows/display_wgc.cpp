@@ -170,67 +170,33 @@ namespace platf::dxgi {
       }
 
       auto d3d_img = std::static_pointer_cast<img_d3d_t>(img);
-      d3d_img->blank = false;  // image is always ready for capture
-
-      auto current_tex = d3d_img->capture_texture.get();
-      auto new_tex = src.get();
-
-      // Only rebuild handles when the underlying shared texture changes (e.g., reinit).
-      // This keeps a stable NT handle for in-flight encoder work instead of churning it every frame.
-      if (current_tex != new_tex) {
-        d3d_img->capture_mutex.reset();
-        if (d3d_img->encoder_texture_handle) {
-          CloseHandle(d3d_img->encoder_texture_handle);
-          d3d_img->encoder_texture_handle = nullptr;
-        }
-
-        d3d_img->capture_texture.reset(src.release());
-
-        HRESULT status = d3d_img->capture_texture->QueryInterface(__uuidof(IDXGIKeyedMutex), (void **) &d3d_img->capture_mutex);
-        if (FAILED(status)) {
-          BOOST_LOG(error) << "Failed to query IDXGIKeyedMutex from shared texture [0x"sv << util::hex(status).to_string_view() << ']';
-          return capture_e::error;
-        }
-
-        resource1_t resource;
-        status = d3d_img->capture_texture->QueryInterface(__uuidof(IDXGIResource1), (void **) &resource);
-        if (FAILED(status)) {
-          BOOST_LOG(error) << "Failed to query IDXGIResource1 [0x"sv << util::hex(status).to_string_view() << ']';
-          return capture_e::error;
-        }
-
-        status = resource->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ, nullptr, &d3d_img->encoder_texture_handle);
-        if (FAILED(status)) {
-          BOOST_LOG(error) << "Failed to create NT shared texture handle [0x"sv << util::hex(status).to_string_view() << ']';
-          return capture_e::error;
-        }
+      if (complete_img(d3d_img.get(), false)) {
+        return capture_e::error;
       }
 
-      // Set the format and other properties
-      d3d_img->format = capture_format;
-      d3d_img->pixel_pitch = get_pixel_pitch();
-      d3d_img->row_pitch = d3d_img->pixel_pitch * d3d_img->width;
-      d3d_img->data = (std::uint8_t *) d3d_img->capture_texture.get();
+      HRESULT status = d3d_img->capture_mutex->AcquireSync(0, 3000);
+      if (status == WAIT_ABANDONED) {
+        BOOST_LOG(error) << "Capture texture keyed mutex was abandoned; continuing with lock held";
+      } else if (status != S_OK) {
+        BOOST_LOG(error) << "Failed to lock capture texture [0x"sv << util::hex(status).to_string_view() << ']';
+        return capture_e::error;
+      }
+
+      auto release_capture_mutex = util::fail_guard([&]() {
+        const HRESULT release_status = d3d_img->capture_mutex->ReleaseSync(0);
+        if (FAILED(release_status)) {
+          BOOST_LOG(warning) << "Failed to release capture texture mutex [0x"sv << util::hex(release_status).to_string_view() << ']';
+        }
+      });
+
+      // The IPC texture is a single mutable helper-owned surface. Snapshot it into
+      // this pool-owned texture so queued encoder frames remain stable.
+      device_ctx->CopyResource(d3d_img->capture_texture.get(), src.get());
+      d3d_img->blank = false;
 
       img->frame_timestamp = frame_timestamp;
       img->host_processing_timestamp = host_processing_timestamp;
       img_out = img;
-
-      // Cache this frame for potential reuse
-      last_cached_frame = img;
-
-      return capture_e::ok;
-
-    } else if (capture_status == capture_e::timeout && config::video.capture == "wgcc" && last_cached_frame) {
-      // No new frame available, but we have a cached frame - forward it
-      // This mimics the DDUP ofa::forward_last_img behavior
-      // Only do this for genuine timeouts, not for errors
-      img_out = last_cached_frame;
-      // Update timestamp to current time to maintain proper timing
-      if (img_out) {
-        img_out->frame_timestamp = std::chrono::steady_clock::now();
-        img_out->host_processing_timestamp = img_out->frame_timestamp;
-      }
 
       return capture_e::ok;
 
@@ -346,21 +312,6 @@ namespace platf::dxgi {
     auto status = _ipc_session->acquire(timeout, gpu_tex, frame_qpc);
 
     if (status != capture_e::ok) {
-      // For constant FPS mode (wgcc), try to return cached frame on timeout
-      if (status == capture_e::timeout && config::video.capture == "wgcc" && last_cached_frame) {
-        // No new frame available, but we have a cached frame - forward it
-        // This mimics the DDUP ofa::forward_last_img behavior
-        // Only do this for genuine timeouts, not for errors
-        img_out = last_cached_frame;
-        // Update timestamp to current time to maintain proper timing
-        if (img_out) {
-          img_out->frame_timestamp = std::chrono::steady_clock::now();
-          img_out->host_processing_timestamp = img_out->frame_timestamp;
-        }
-
-        return capture_e::ok;
-      }
-
       // For the default mode just return the capture status on timeouts.
       return status;
     }
@@ -468,9 +419,6 @@ namespace platf::dxgi {
     auto frame_timestamp = host_processing_timestamp - qpc_time_difference(qpc_counter(), frame_qpc);
     img->frame_timestamp = frame_timestamp;
     img->host_processing_timestamp = host_processing_timestamp;
-
-    // Cache this frame for potential reuse in constant FPS mode
-    last_cached_frame = img_out;
 
     return capture_e::ok;
   }

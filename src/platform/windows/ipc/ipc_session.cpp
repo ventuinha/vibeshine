@@ -34,6 +34,7 @@
 namespace platf::dxgi {
   namespace {
     constexpr auto kRecentDesktopSwitchGrace = std::chrono::seconds(3);
+    constexpr std::int64_t kWgcMinUpdateInterval100ns = 10000;  // 1 ms
     std::atomic<std::int64_t> g_last_wgc_desktop_switch_us {0};
 
     std::int64_t now_steady_us() {
@@ -43,6 +44,10 @@ namespace platf::dxgi {
 
     void record_recent_wgc_desktop_switch() {
       g_last_wgc_desktop_switch_us.store(now_steady_us(), std::memory_order_relaxed);
+    }
+
+    std::int64_t wgc_min_update_interval_100ns() {
+      return kWgcMinUpdateInterval100ns;
     }
 
     struct frame_metadata_snapshot_t {
@@ -265,6 +270,7 @@ namespace platf::dxgi {
     config_data_t config_data = {};
     config_data.dynamic_range = _config.dynamicRange;
     config_data.log_level = config::sunshine.min_log_level;
+    config_data.min_update_interval_100ns = wgc_min_update_interval_100ns();
 
     // Convert display_name (std::string) to wchar_t[32]
     if (!_display_name.empty()) {
