@@ -41,6 +41,13 @@ namespace rtsp_stream {
     int width;
     int height;
     int fps;
+    // Client-reported display refresh rate × 100 (e.g. 12059 for a 120.59 Hz
+    // panel). Set during RTSP ANNOUNCE from `x-nv-video[0].clientRefreshRateX100`
+    // after the consistency validator runs. Zero when the client doesn't send
+    // it or the validator rejected the value. Consumers should prefer this
+    // over the integer `fps` whenever > 0 to keep the virtual display's mode
+    // aligned with the panel's actual fractional refresh.
+    int framerateX100 = 0;
     int gcmap;
     int appid;
 

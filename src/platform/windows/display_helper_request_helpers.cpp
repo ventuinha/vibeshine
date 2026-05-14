@@ -88,6 +88,7 @@ namespace display_helper_integration::helpers {
       snapshot.width = session.width;
       snapshot.height = session.height;
       snapshot.fps = session.fps;
+      snapshot.framerateX100 = session.framerateX100;
       snapshot.appid = session.appid;
       snapshot.app_metadata = session.app_metadata;
       snapshot.client_display_mode_override = session.client_display_mode_override;
