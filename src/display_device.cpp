@@ -284,26 +284,12 @@ namespace display_device {
     bool parse_refresh_rate_option(const config::video_t &video_config, const rtsp_stream::launch_session_t &session, SingleDisplayConfiguration &config) {
       using refresh_rate_option_e = config::video_t::dd_t::refresh_rate_option_e;
 
-      // When the client reports a fractional refresh rate (e.g. 12059 for
-      // 120.59 Hz panels common on stepped-refresh OLEDs) and framegen isn't
-      // overriding the target, prefer Rational {framerateX100, 100} so the
-      // virtual display gets allocated at the panel's exact refresh instead
-      // of a rounded integer. Avoids the host-emit-vs-panel beat that shows
-      // up as periodic pacing drops on the client.
-      auto build_target_refresh = [&](int target_fps) -> Rational {
-        const bool framegen_active = session.framegen_refresh_rate && *session.framegen_refresh_rate > 0;
-        if (!framegen_active && session.framerateX100 > 0) {
-          return Rational {static_cast<unsigned int>(session.framerateX100), 100u};
-        }
-        return Rational {static_cast<unsigned int>(target_fps), 1u};
-      };
-
       // Client display_mode override takes highest priority
       if (session.client_display_mode_override) {
         const int target_fps = (session.framegen_refresh_rate && *session.framegen_refresh_rate > 0) ? *session.framegen_refresh_rate : session.fps;
         if (target_fps >= 0) {
-          config.m_refresh_rate = build_target_refresh(target_fps);
-          BOOST_LOG(debug) << "Using client display mode override for refresh rate: " << target_fps << " Hz (framerateX100=" << session.framerateX100 << ")";
+          config.m_refresh_rate = Rational {static_cast<unsigned int>(target_fps), 1};
+          BOOST_LOG(debug) << "Using client display mode override for refresh rate: " << target_fps << " Hz";
         } else {
           BOOST_LOG(error) << "FPS value provided by client display mode override is invalid: " << target_fps;
           return false;
@@ -316,7 +302,7 @@ namespace display_device {
           {
             const int target_fps = (session.framegen_refresh_rate && *session.framegen_refresh_rate > 0) ? *session.framegen_refresh_rate : session.fps;
             if (target_fps >= 0) {
-              config.m_refresh_rate = build_target_refresh(target_fps);
+              config.m_refresh_rate = Rational {static_cast<unsigned int>(target_fps), 1};
             } else {
               BOOST_LOG(error) << "FPS value provided by client session config is invalid: " << target_fps;
               return false;

@@ -1115,11 +1115,6 @@ namespace rtsp_stream {
         }
       }
 
-      // Plumb the (possibly-validated) fractional refresh rate onto the
-      // launch_session so the display_device path can use it for virtual
-      // display mode allocation, not just encoder pacing.
-      session.framerateX100 = config.monitor.framerateX100;
-
       configuredBitrateKbps = util::from_view(args.at("x-ml-video.configuredBitrateKbps"sv));
     } catch (std::out_of_range &) {
       respond(sock, session, &option, 400, "BAD REQUEST", req->sequenceNumber, {});
