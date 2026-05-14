@@ -259,7 +259,13 @@ namespace VDISPLAY {
       return std::string(value.substr(start, end - start + 1));
     }
 
-    std::optional<uint32_t> parse_refresh_hz(std::string_view value) {
+    // Parses a refresh-rate string (e.g. "120", "120.595") into millihz.
+    // Returning millihz directly preserves fractional precision that
+    // SudoVDA's AddVirtualDisplay accepts via its uint32_t RefreshRate
+    // parameter (interpreted in millihz). Previously this returned integer
+    // Hz and callers multiplied by 1000, which truncated "120.595" to 121
+    // (then *1000 = 121000 millihz) before the driver ever saw it.
+    std::optional<uint32_t> parse_refresh_millihz(std::string_view value) {
       const auto trimmed = trim_copy(value);
       if (trimmed.empty()) {
         return std::nullopt;
@@ -269,8 +275,9 @@ namespace VDISPLAY {
         if (!std::isfinite(hz) || hz <= 0.0) {
           return std::nullopt;
         }
-        const double clamped = std::min(hz, static_cast<double>(std::numeric_limits<uint32_t>::max()));
-        const auto rounded = static_cast<uint32_t>(std::lround(clamped));
+        const double millihz = hz * 1000.0;
+        const double clamped = std::min(millihz, static_cast<double>(std::numeric_limits<uint32_t>::max()));
+        const auto rounded = static_cast<uint32_t>(std::llround(clamped));
         if (rounded == 0) {
           return std::nullopt;
         }
@@ -280,20 +287,20 @@ namespace VDISPLAY {
       }
     }
 
-    uint32_t highest_requested_refresh_hz() {
+    uint32_t highest_requested_refresh_millihz() {
       using dd_t = config::video_t::dd_t;
-      uint32_t max_hz = 0;
+      uint32_t max_millihz = 0;
 
       if (config::video.dd.refresh_rate_option == dd_t::refresh_rate_option_e::manual) {
-        if (auto manual = parse_refresh_hz(config::video.dd.manual_refresh_rate)) {
-          max_hz = std::max(max_hz, *manual);
+        if (auto manual = parse_refresh_millihz(config::video.dd.manual_refresh_rate)) {
+          max_millihz = std::max(max_millihz, *manual);
         }
       }
 
       const auto process_entries = [&](const auto &entries) {
         for (const auto &entry : entries) {
-          if (auto parsed = parse_refresh_hz(entry.final_refresh_rate)) {
-            max_hz = std::max(max_hz, *parsed);
+          if (auto parsed = parse_refresh_millihz(entry.final_refresh_rate)) {
+            max_millihz = std::max(max_millihz, *parsed);
           }
         }
       };
@@ -302,19 +309,15 @@ namespace VDISPLAY {
       process_entries(config::video.dd.mode_remapping.refresh_rate_only);
       process_entries(config::video.dd.mode_remapping.resolution_only);
 
-      return max_hz;
+      return max_millihz;
     }
 
     uint32_t apply_refresh_overrides(uint32_t fps_millihz, uint32_t base_fps_millihz = 0u, bool framegen_refresh_active = false) {
-      constexpr uint64_t scale = 1000ull;
       using dd_t = config::video_t::dd_t;
       // Manual refresh rate override takes priority over everything, including doubled refresh rates.
       if (config::video.dd.refresh_rate_option == dd_t::refresh_rate_option_e::manual) {
-        if (auto manual = parse_refresh_hz(config::video.dd.manual_refresh_rate)) {
-          const uint64_t forced = static_cast<uint64_t>(*manual) * scale;
-          return static_cast<uint32_t>(
-            std::min<uint64_t>(forced, std::numeric_limits<uint32_t>::max())
-          );
+        if (auto manual_millihz = parse_refresh_millihz(config::video.dd.manual_refresh_rate)) {
+          return *manual_millihz;
         }
       }
       // Either option (virtual_double_refresh or framegen) requests a minimum of 2x base fps
@@ -327,16 +330,14 @@ namespace VDISPLAY {
           fps_millihz = safe_minimum;
         }
       }
-      const uint32_t max_hz = highest_requested_refresh_hz();
-      if (max_hz == 0) {
+      const uint32_t required_millihz = highest_requested_refresh_millihz();
+      if (required_millihz == 0) {
         return fps_millihz;
       }
-      uint64_t required = static_cast<uint64_t>(max_hz) * scale;
-      if (required <= fps_millihz) {
+      if (required_millihz <= fps_millihz) {
         return fps_millihz;
       }
-      required = std::min<uint64_t>(required, std::numeric_limits<uint32_t>::max());
-      return static_cast<uint32_t>(required);
+      return required_millihz;
     }
 
     class DevInfoHandle {
