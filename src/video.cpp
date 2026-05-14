@@ -2376,7 +2376,14 @@ namespace video {
     });
 
     // set max frame time based on client-requested target framerate.
-    double minimum_fps_target = (config::video.minimum_fps_target > 0.0) ? config::video.minimum_fps_target : config.framerate;
+    // Prefer the client's reported fractional display rate (e.g. 12059 = 120.595 Hz)
+    // over the integer config.framerate when computing the auto fallback for
+    // minimum_fps_target. Keeps emit cadence aligned with the panel when the
+    // user leaves minimum_fps_target at 0 (= match client fps).
+    double effective_fps = (config.framerateX100 > 0)
+      ? (config.framerateX100 / 100.0)
+      : (double) config.framerate;
+    double minimum_fps_target = (config::video.minimum_fps_target > 0.0) ? config::video.minimum_fps_target : effective_fps;
     std::chrono::duration<double, std::milli> max_frametime {1000.0 / minimum_fps_target};
     BOOST_LOG(info) << "Minimum FPS target set to ~"sv << (minimum_fps_target / 2) << "fps ("sv << max_frametime.count() * 2 << "ms)"sv;
 

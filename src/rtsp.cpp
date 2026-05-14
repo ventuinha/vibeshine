@@ -1104,12 +1104,13 @@ namespace rtsp_stream {
       // while requesting a higher maxFPS (e.g. 120). Since framerateX100 unconditionally
       // overrides capture pacing, an inconsistent value caps the stream to the wrong fps.
       if (config.monitor.framerateX100 > 0 && config.monitor.framerate > 0) {
-        int fps_from_x100 = (int) std::lround(config.monitor.framerateX100 / 100.0);
-        if (fps_from_x100 != config.monitor.framerate) {
+        double fps_from_x100 = config.monitor.framerateX100 / 100.0;
+        double delta = std::fabs(fps_from_x100 - (double) config.monitor.framerate);
+        if (delta > 1.0) {
           BOOST_LOG(warning) << "clientRefreshRateX100 ("
                              << config.monitor.framerateX100 << " = " << fps_from_x100
                              << "fps) disagrees with maxFPS (" << config.monitor.framerate
-                             << "); ignoring clientRefreshRateX100";
+                             << ") by " << delta << " fps; ignoring clientRefreshRateX100";
           config.monitor.framerateX100 = 0;
         }
       }
